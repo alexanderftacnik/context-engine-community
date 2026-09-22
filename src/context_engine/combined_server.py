@@ -1,8 +1,13 @@
-"""Combined server — OAuth + API key MCP SSE behind one port for Railway.
+"""Combined server — OAuth + API key MCP behind one port for Railway.
 
-Two access methods:
-1. /sse — OAuth 2.1 (for Cowork, supports DCR)
-2. /api/sse — API key Bearer token (for OpenClaw and other clients)
+Four access methods (two transports x two auth methods):
+1. /mcp      — Streamable HTTP, OAuth 2.1 (claude.ai, Claude Code, Cowork; supports DCR)
+2. /api/mcp  — Streamable HTTP, API key Bearer token (OpenClaw and other clients)
+3. /sse      — legacy SSE, OAuth 2.1 (kept for older clients; SSE is being deprecated)
+4. /api/sse  — legacy SSE, API key Bearer token
+
+Streamable HTTP runs stateless: every request stands alone, so an idle client
+never loses its session (SSE on Railway silently dropped idle connections).
 
 Uses two FastMCP instances sharing the same DB — one with OAuth, one without.
 Tools are registered via shared register_tools() function.
@@ -11,10 +16,13 @@ Tools are registered via shared register_tools() function.
 import os
 import sys
 import asyncio
+import contextlib
+import sqlite3
+import tempfile
 
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, FileResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 from uvicorn import Config, Server
 
@@ -110,7 +118,9 @@ def create_app():
     mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
     )
-    oauth_mcp_app = mcp.sse_app()
+    mcp.settings.stateless_http = True
+    oauth_mcp_app = mcp.sse_app()                 # legacy: /sse, /messages/
+    oauth_http_app = mcp.streamable_http_app()    # /mcp (stateless, OAuth via RequireAuthMiddleware)
 
     # ── MCP instance 2: No auth (API key handled by middleware) ──
     from mcp.server.fastmcp import FastMCP
@@ -127,7 +137,10 @@ def create_app():
     # Copy all tools from OAuth instance to API key instance
     for name, tool in mcp._tool_manager._tools.items():
         mcp_api._tool_manager._tools[name] = tool
-    api_mcp_app = BearerTokenMiddleware(mcp_api.sse_app(), api_key)
+    mcp_api.settings.stateless_http = True
+    mcp_api.settings.streamable_http_path = "/api/mcp"   # Route (not Mount) below keeps the full path
+    api_mcp_app = BearerTokenMiddleware(mcp_api.sse_app(), api_key)            # legacy: /api/sse
+    api_http_app = BearerTokenMiddleware(mcp_api.streamable_http_app(), api_key)  # /api/mcp
 
     # ── Utility endpoints ─────────────────────────────────────
     async def health(request):
@@ -145,16 +158,48 @@ def create_app():
             f.write(body)
         return PlainTextResponse(f"ok, wrote {len(body)} bytes to {db_path}")
 
+    async def download_db(request):
+        """Consistent snapshot of the live DB (sqlite backup API, WAL-safe)."""
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {oauth_pass}":
+            return PlainTextResponse("unauthorized", status_code=401)
+        db_path = os.environ.get("CTX_DB", "/data/context-engine.db")
+        if not os.path.exists(db_path):
+            return PlainTextResponse("no database", status_code=404)
+        fd, snapshot = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        src = sqlite3.connect(db_path)
+        dst = sqlite3.connect(snapshot)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+        return FileResponse(snapshot, media_type="application/octet-stream",
+                            filename="context-engine.db")
+
+    # ── Lifespan: streamable-http session managers must run inside it ──
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        async with mcp.session_manager.run():
+            async with mcp_api.session_manager.run():
+                yield
+
     # ── Routes ────────────────────────────────────────────────
+    # Streamable HTTP endpoints are plain Routes whose endpoint is the FastMCP
+    # Starlette app, so the auth middleware inside that app still applies and the
+    # request path reaches it unchanged (a Mount would strip the prefix).
     all_routes = [
         Route("/health", health),
         Route("/admin/upload-db", upload_db, methods=["POST"]),
+        Route("/admin/download-db", download_db, methods=["GET"]),
+        Route("/mcp", endpoint=oauth_http_app),        # OAuth: streamable HTTP
+        Route("/api/mcp", endpoint=api_http_app),      # API key: streamable HTTP
         Mount("/api", app=api_mcp_app),   # API key: /api/sse, /api/messages/
     ] + oauth_routes + [
         Mount("/", app=oauth_mcp_app),    # OAuth: /sse, /messages/
     ]
 
-    return Starlette(routes=all_routes), host, port
+    return Starlette(routes=all_routes, lifespan=lifespan), host, port
 
 
 def main():
